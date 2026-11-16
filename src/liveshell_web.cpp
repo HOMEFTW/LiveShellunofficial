@@ -42,6 +42,8 @@ extern const uint8_t liveshell_page_html[];
 extern const uint8_t liveshell_page_html_end[];
 extern const uint8_t liveshell_remote_html[];
 extern const uint8_t liveshell_remote_html_end[];
+extern const uint8_t liveshell_i18n_js[];
+extern const uint8_t liveshell_i18n_js_end[];
 }
 
 __asm__(".section .rodata\n"
@@ -61,6 +63,15 @@ __asm__(".section .rodata\n"
         "liveshell_remote_html:\n"
         ".incbin \"" LIVESHELL_REMOTE_HTML "\"\n"
         "liveshell_remote_html_end:\n"
+        ".previous\n");
+
+__asm__(".section .rodata\n"
+        ".global liveshell_i18n_js\n"
+        ".global liveshell_i18n_js_end\n"
+        ".align 16\n"
+        "liveshell_i18n_js:\n"
+        ".incbin \"" LIVESHELL_I18N_JS "\"\n"
+        "liveshell_i18n_js_end:\n"
         ".previous\n");
 
 namespace liveshell {
@@ -86,24 +97,25 @@ std::string json_str(const std::string& s) {
 
 std::string state_json() {
 	const State st = get_state();
-	std::string j  = std::string("{\"enabled\":") + (st.enabled ? "true" : "false") + ",\"dim\":" + std::to_string(st.dim) + ",\"volume\":" + std::to_string(st.volume) +
+	std::string j  = std::string("{\"language\":") + json_str(st.language) + ",\"enabled\":" + (st.enabled ? "true" : "false") + ",\"dim\":" + std::to_string(st.dim) + ",\"volume\":" + std::to_string(st.volume) +
 	                ",\"looks\":[" + std::to_string(st.looks[0]) + "," + std::to_string(st.looks[1]) + "," + std::to_string(st.looks[2]) + "," + std::to_string(st.looks[3]) + "]" + ",\"shuffle\":" + (st.shuffle ? "true" : "false") + ",\"mainvideo\":" + (st.main_video ? "true" : "false") + ",\"gamevideos\":" + (st.game_videos ? "true" : "false") + ",\"gamepause\":" + (st.game_pause ? "true" : "false") + ",\"menuhide\":" + (st.menu_hide ? "true" : "false") + ",\"storeonly\":" + (st.store_only ? "true" : "false") + ",\"parallax\":" + (st.parallax ? "true" : "false") + ",\"automatch\":" + (st.auto_match ? "true" : "false") + ",\"resume\":" + (st.resume ? "true" : "false") + ",\"launchfx\":" + std::to_string(st.launchfx) + ",\"autonext\":" + std::to_string(st.autonext) + ",\"plbak\":" + (st.pl_bak ? "true" : "false") + ",\"tint\":" + std::to_string(st.tint) + ",\"playlist\":" + json_str(st.playlist) + ",\"users\":" + users_json() + ",\"gamehide\":" + (st.game_hide ? "true" : "false") +
 	                ",\"ip\":" + json_str(st.ip) + ",\"port\":" + std::to_string(kWebPort) + ",\"games\":" + json_str(games_text()) + ",\"game\":" + json_str(st.game) + ",\"status\":" + json_str(st.status) + ",\"current\":" + json_str(st.current) + ",\"main4k\":false,\"videos\":[";
 	const std::vector<std::string> fav = favorites();
 	for (size_t i = 0; i < st.videos.size(); ++i) {
 		const Video& v = st.videos[i];
+		const bool image = media::is_image(v.path);
 		j += (i ? ",{" : "{");
 		struct stat fs {};
 		const long long size = stat(v.path.c_str(), &fs) == 0 ? static_cast<long long>(fs.st_size) : 0;
 		struct stat ts {};
 		const std::string cover = v.path.substr(0, v.path.rfind('.')) + ".png";
-		const bool        thumb = stat(cover.c_str(), &ts) == 0 && ts.st_size >= kMinThumb;
+		const bool        thumb = image || (stat(cover.c_str(), &ts) == 0 && ts.st_size >= kMinThumb);
 		j += "\"name\":" + json_str(v.name) + ",\"where\":" + json_str(v.where) + ",\"path\":" + json_str(v.path) +
-		     ",\"size\":" + std::to_string(size) + ",\"thumb\":" + (thumb ? "true" : "false") +
+		     ",\"size\":" + std::to_string(size) + ",\"image\":" + (image ? "true" : "false") + ",\"thumb\":" + (thumb ? "true" : "false") +
 		     ",\"fav\":" + (std::find(fav.begin(), fav.end(), v.path) != fav.end() ? "true" : "false") +
 		     ",\"why\":" + json_str(clip_problem(v.path)) + ",\"k4\":" + (clip_is_big(v.path) ? "true" : "false") + ",\"res\":" + json_str(clip_res(v.path)) + ",\"snd\":" + (clip_has_audio(v.path) ? "true" : "false") + "}";
 	}
-	return j + "]}";
+	return j + "],\"music\":" + music_json() + "}";
 }
 
 std::string result_json(bool ok, const std::string& error) {
@@ -155,10 +167,16 @@ bool video_at(int i, Video& out) {
 	return true;
 }
 
+void serve_video(int fd, int i, const char* request, bool log_it, bool fast);
+
 void serve_thumb(int fd, int i) {
 	Video v;
 	if (!video_at(i, v)) {
 		reply_404(fd);
+		return;
+	}
+	if (media::is_image(v.path)) {
+		serve_video(fd, i, "", false, false); // the picture itself is its preview
 		return;
 	}
 	const std::string path = v.path.substr(0, v.path.rfind('.')) + ".png";
@@ -351,6 +369,13 @@ void serve_video(int fd, int i, const char* request, bool log_it = false, bool f
 		return;
 	}
 	const long long size  = static_cast<long long>(st.st_size);
+	const bool image = media::is_image(v.path);
+	const media::ImageInfo picture = image ? media::image_info(v.path) : media::ImageInfo {};
+	if (image && !picture.error.empty()) {
+		reply_404(fd);
+		return;
+	}
+	const char* type = image ? picture.mime : "video/mp4";
 	long long       first = 0, last = size - 1;
 	bool            range = false;
 	if (const char* r = strcasestr(request, "\nRange: bytes=")) {
@@ -385,19 +410,19 @@ void serve_video(int fd, int i, const char* request, bool log_it = false, bool f
 		return;
 	}
 	FastStart fs; // 4K stream: the index first (moov at the end otherwise)
-	if (fast) {
+	if (fast && !image) {
 		std::lock_guard<std::mutex> lock(g_fs_lock);
 		fast_start(v.path, st, fs);
 	}
 	char      head[320];
 	const int n = range ? snprintf(head, sizeof(head),
-	                               "HTTP/1.1 206 Partial Content\r\nContent-Type: video/mp4\r\nAccept-Ranges: bytes\r\n"
+	                               "HTTP/1.1 206 Partial Content\r\nContent-Type: %s\r\nAccept-Ranges: bytes\r\n"
 	                               "Content-Range: bytes %lld-%lld/%lld\r\nContent-Length: %lld\r\nConnection: close\r\n\r\n",
-	                               first, last, size, last - first + 1)
+	                               type, first, last, size, last - first + 1)
 	                    : snprintf(head, sizeof(head),
-	                               "HTTP/1.1 200 OK\r\nContent-Type: video/mp4\r\nAccept-Ranges: bytes\r\n"
+	                               "HTTP/1.1 200 OK\r\nContent-Type: %s\r\nAccept-Ranges: bytes\r\n"
 	                               "Content-Length: %lld\r\nConnection: close\r\n\r\n",
-	                               size);
+	                               type, size);
 	send_all(fd, head, static_cast<size_t>(n));
 	static thread_local char buf[64 * 1024];
 	long long at = first;
@@ -436,7 +461,7 @@ void save_thumb(int fd, int i, const char* headers, const char* body, size_t hav
 	Video       v;
 	const char* cl   = strcasestr(headers, "\nContent-Length:");
 	const long  size = cl != nullptr ? strtol(cl + 16, nullptr, 10) : 0;
-	if (!video_at(i, v) || size < kMinThumb || static_cast<size_t>(size) > kMaxThumb) {
+	if (!video_at(i, v) || media::is_image(v.path) || size < kMinThumb || static_cast<size_t>(size) > kMaxThumb) {
 		reply_json(fd, result_json(false, "bad thumbnail"));
 		return;
 	}
@@ -477,8 +502,8 @@ std::string url_decode(const std::string& raw) {
 	return out;
 }
 
-// Upload from a phone / PC: POST /api/upload?name=<file>.mp4, raw body. Only plain file names,
-// only .mp4, only into /data/LiveShell/video; written as .part and renamed when complete.
+// Upload from a phone / PC: MP4s, PNG/JPEGs and MP3s go in video, pictures and music respectively.
+// Only plain file names; written as .part, image headers checked, then renamed when complete.
 void save_upload(int fd, const std::string& query, const char* headers, const char* body, size_t have) {
 	const size_t      at  = query.find("name=");
 	const std::string raw = at == std::string::npos ? "" : url_decode(query.substr(at + 5, query.find('&', at) - (at + 5)));
@@ -496,18 +521,25 @@ void save_upload(int fd, const std::string& query, const char* headers, const ch
 	if (name.size() > 120) {
 		name = name.substr(name.size() - 120);
 	}
-	const bool      is_mp4 = name.size() > 4 && strcasecmp(name.c_str() + name.size() - 4, ".mp4") == 0;
+	const bool      picture = media::is_image(name);
+	const bool      music = media::extension(name) == ".mp3";
 	const char*     cl     = strcasestr(headers, "\nContent-Length:");
 	const long long size   = cl != nullptr ? strtoll(cl + 16, nullptr, 10) : 0;
-	if (!is_mp4 || size <= 0 || size > 8LL * 1024 * 1024 * 1024) {
-		reply_json(fd, result_json(false, "Only .mp4 files can be uploaded"));
+	if ((!media::is_wallpaper(name) && !music) || size <= 0 ||
+	    size > (picture ? media::kMaxImageBytes : music ? kMaxMusicBytes : 8LL * 1024 * 1024 * 1024)) {
+		reply_json(fd, result_json(false, "Use MP4 (up to 8 GB), PNG/JPEG (up to 32 MB), or MP3 (up to 64 MB)"));
 		return;
 	}
-	const std::string path = "/data/LiveShell/video/" + name;
+	const std::string folder = picture ? "/data/LiveShell/pictures" : music ? "/data/LiveShell/music" : "/data/LiveShell/video";
+	if (mkdir(folder.c_str(), 0777) != 0 && errno != EEXIST) {
+		reply_json(fd, result_json(false, "Cannot create the media folder"));
+		return;
+	}
+	const std::string path = folder + "/" + name;
 	const std::string part = path + ".part";
 	const int         f    = open(part.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0666);
 	if (f < 0) {
-		reply_json(fd, result_json(false, "Cannot write to /data/LiveShell/video"));
+		reply_json(fd, result_json(false, "Cannot write to " + folder));
 		return;
 	}
 	log("upload %s: %lld bytes", name.c_str(), size);
@@ -530,10 +562,11 @@ void save_upload(int fd, const std::string& query, const char* headers, const ch
 		done += got;
 	}
 	close(f);
-	if (!ok || done != size || rename(part.c_str(), path.c_str()) != 0) {
+	const std::string problem = ok && done == size ? (picture ? media::image_info(part).error : music ? music_problem(part) : "") : "";
+	if (!ok || done != size || !problem.empty() || rename(part.c_str(), path.c_str()) != 0) {
 		unlink(part.c_str());
 		log("upload %s: FAILED at %lld of %lld bytes", name.c_str(), done, size);
-		reply_json(fd, result_json(false, "Upload stopped before the end"));
+		reply_json(fd, result_json(false, problem.empty() ? "Upload stopped before the end or could not be saved" : problem));
 		return;
 	}
 	log("upload %s: done", name.c_str());
@@ -679,6 +712,9 @@ void handle(int fd) {
 	} else if (path == "/" || path == "/index.html" || path == "/ps5") {
 		reply(fd, "200 OK", "text/html; charset=utf-8", liveshell_page_html,
 		      static_cast<size_t>(liveshell_page_html_end - liveshell_page_html));
+	} else if (path == "/i18n.js") {
+		reply(fd, "200 OK", "application/javascript; charset=utf-8", liveshell_i18n_js,
+		      static_cast<size_t>(liveshell_i18n_js_end - liveshell_i18n_js));
 	} else if (path == "/icon.png") {
 		reply(fd, "200 OK", "image/png", liveshell_icon_png,
 		      static_cast<size_t>(liveshell_icon_png_end - liveshell_icon_png));
@@ -705,6 +741,35 @@ void handle(int fd) {
 			g_page_seen = static_cast<long>(time(nullptr)); // our window on the PS5 polls every second
 		}
 		reply_json(fd, state_json());
+	} else if (path == "/api/language") {
+		const size_t at = query.find("v=");
+		const std::string language = at == std::string::npos ? "" : url_decode(query.substr(at + 2, query.find('&', at) - (at + 2)));
+		reply_json(fd, result_json(set_language(language, error), error));
+	} else if (path == "/api/music/select" || path == "/api/music/delete") {
+		const int i = index_arg(query);
+		const auto tracks = list_music();
+		bool ok = false;
+		if (i == -1 && path == "/api/music/select") {
+			ok = select_music("", error);
+		} else if (i >= 0 && i < static_cast<int>(tracks.size())) {
+			ok = path == "/api/music/select" ? select_music(tracks[i].path, error) : delete_music(tracks[i].path, error);
+		} else {
+			error = "No such music file";
+		}
+		reply_json(fd, result_json(ok, error));
+	} else if (path == "/api/music/volume" || path == "/api/music/repeat") {
+		const size_t at = query.find("v=");
+		if (at == std::string::npos) {
+			reply_json(fd, result_json(false, "Missing music setting"));
+		} else {
+			const int value = atoi(query.c_str() + at + 2);
+			if (path == "/api/music/volume") {
+				set_music_volume(value);
+			} else {
+				set_music_repeat(value);
+			}
+			reply_json(fd, result_json(true, ""));
+		}
 	} else if (path == "/api/select") {
 		Video v;
 		const bool ok = video_at(index_arg(query), v) ? select_video(v.path, error) : (error = "No such video", false);

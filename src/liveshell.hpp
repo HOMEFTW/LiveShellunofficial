@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <string>
 #include <vector>
+#include "liveshell_media.hpp"
 
 namespace liveshell {
 
@@ -16,7 +17,7 @@ void notify(const char* text);       // system icon
 void notify_plain(const char* text); // text only (debug style)
 
 struct Video {
-	std::string path;   // real path, e.g. /data/LiveShell/video/x.mp4
+	std::string path;   // wallpaper: an MP4 in video, or PNG/JPEG in pictures
 	std::string name;   // file name
 	std::string where;  // "Internal" or "USB 1"..
 };
@@ -50,11 +51,13 @@ struct State {
 	std::string        game;               // title id of the running game ("" = none)
 	std::string        current;  // real path of the chosen clip ("" = none)
 	std::string        status;   // ShellUI status line: playing / stopped / failed / starting
+	std::string        language = "zh-CN";
 	std::vector<Video> videos;
 };
 
 std::vector<Video> list_videos();
 State              get_state();
+bool set_language(const std::string& language, std::string& error);
 // Pick a clip / switch on or off. Safe to call from any thread; blocks until ShellUI let go of
 // the old clip (a few seconds at most). Returns false with a reason on failure.
 bool select_video(const std::string& path, std::string& error);
@@ -112,6 +115,21 @@ void              write_fast_map(); // ShellUI's fast-switch map; caller holds g
 
 void start_web_server();
 bool page_open(); // the LiveShell window's page is polling (it is open on the PS5)
+
+// Global background music, separate from wallpaper selection. MP3 playback is active only while a picture is visible.
+constexpr long long kMaxMusicBytes = 64LL * 1024 * 1024;
+std::vector<Video> list_music();
+std::string music_json();
+std::string music_problem(const std::string& path);
+bool select_music(const std::string& path, std::string& error); // empty = no music
+bool delete_music(const std::string& path, std::string& error);
+void set_music_volume(int percent);
+void set_music_repeat(int mode); // 0 single-track loop, 1 loop the whole music list
+void music_visible(bool visible); // ShellUI heartbeat; stale visibility expires automatically
+bool start_music();
+void stop_music();
+int music_output(const int16_t* pcm); // PCM accepted by ShellUI, paused, waiting, or native error
+void close_music_output();
 
 // Home-screen tile that opens kWebUrl. Returns 1 = newly added, 0 = was already there, -1 = failed.
 int install_tile();

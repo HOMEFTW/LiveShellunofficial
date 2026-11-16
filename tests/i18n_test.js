@@ -1,0 +1,37 @@
+const assert = require('node:assert/strict');
+const locale = require('../src/liveshell_i18n.js');
+let checks = 0;
+function expect(source, expected, language = 'zh-CN') {
+  assert.equal(locale.text(source, language), expected, source);
+  checks++;
+}
+expect('Videos', '视频');
+expect('Pictures', '图片');
+expect('Background music', '背景音乐');
+expect('Settings', '设置');
+expect('Language', '界面语言');
+expect('Single-track loop', '单曲循环');
+expect('List loop', '列表循环');
+expect('Playing', '播放中');
+expect('Waiting for home-screen audio', '正在等待主屏音频连接');
+expect('Home-screen audio error (0x80260001)', '主屏音频输出错误（0x80260001）');
+expect('Paused (pictures only)', '已暂停（仅在显示图片时播放）');
+expect('USB 2', 'U 盘 2');
+expect('Internal · 5 MB', '主机内部 · 5 MB');
+expect('3 selected', '已选择 3 项');
+expect('every 5 min', '每 5 分钟');
+expect('Dim 25', '亮度遮罩 25');
+expect('Dim 25 · Vignette', '亮度遮罩 25 · 暗角');
+expect('Upload wallpapers at 192.168.1.20:9050', '壁纸上传地址：192.168.1.20:9050');
+expect('Upload wallpapers at ', '壁纸上传地址： ');
+expect('Switching to 海岸.png', '正在切换至 海岸.png');
+expect('Switching to 海岸$&.png', '正在切换至 海岸$&.png');
+expect('Videos.mp4', 'Videos.mp4');
+expect('/data/LiveShell/music/Settings.mp3', '/data/LiveShell/music/Settings.mp3');
+expect('https://example.com/Settings', 'https://example.com/Settings');
+expect('constructor', 'constructor');
+expect('Settings', 'Settings', 'en');
+expect('Home-screen audio error (0x80260001)', 'Home-screen audio error (0x80260001)', 'en');
+expect('  Videos  ', '  视频  ');
+expect('An unknown user-created title', 'An unknown user-created title');
+console.log(`${checks} language / dynamic message / content preservation checks passed`);

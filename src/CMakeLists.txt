@@ -3,7 +3,7 @@
 #   liveshell_shellui.elf - runs inside SceShellUI (embedded in liveshell.elf)
 #   liveshell.elf         - the payload the user loads
 cmake_minimum_required (VERSION 3.20)
-project(liveshell C CXX ASM)
+project(liveshell VERSION 1.8.0 LANGUAGES C CXX ASM)
 
 onion_module_prologue(C_STANDARD 11 CXX_STANDARD 20)
 set(D_CWD "${CMAKE_CURRENT_SOURCE_DIR}")
@@ -27,18 +27,19 @@ target_link_directories(liveshell_shellui PUBLIC "${ONIONHEN_PS5_STUB_DIR}")
 target_link_libraries(liveshell_shellui PUBLIC onion_payload onion_proc onion_platform onion_detour SceNotification kernel_sys)
 onion_strip_debug(liveshell_shellui)
 
-add_executable(liveshell ${D_CWD}/liveshell_daemon.cpp ${D_CWD}/liveshell_web.cpp ${D_CWD}/liveshell_tile.cpp ${D_CWD}/zstd_decompress.c ${D_CWD}/liveshell_apng.cpp ${D_CWD}/miniz.c)
+add_executable(liveshell ${D_CWD}/liveshell_daemon.cpp ${D_CWD}/liveshell_web.cpp ${D_CWD}/liveshell_music.cpp ${D_CWD}/liveshell_music_transport.cpp ${D_CWD}/liveshell_tile.cpp ${D_CWD}/zstd_decompress.c ${D_CWD}/liveshell_apng.cpp ${D_CWD}/miniz.c)
 set_target_properties(liveshell PROPERTIES OUTPUT_NAME "liveshell.elf")
 target_link_options(liveshell PRIVATE "-Wl,--gc-sections")
 add_dependencies(liveshell liveshell_shellui NineS onion_proc onion_platform onion_elfldr)
 set_source_files_properties(${D_CWD}/liveshell_daemon.cpp PROPERTIES OBJECT_DEPENDS "${ONIONHEN_OUT_BIN}/liveshell_shellui.elf")
-set_source_files_properties(${D_CWD}/liveshell_web.cpp PROPERTIES OBJECT_DEPENDS "${D_CWD}/liveshell_page.html;${D_CWD}/liveshell_remote.html")
+set_source_files_properties(${D_CWD}/liveshell_web.cpp PROPERTIES OBJECT_DEPENDS "${D_CWD}/liveshell_page.html;${D_CWD}/liveshell_remote.html;${D_CWD}/liveshell_i18n.js")
 set_source_files_properties(${D_CWD}/liveshell_tile.cpp PROPERTIES OBJECT_DEPENDS "${D_CWD}/icon0.png")
 target_compile_definitions(liveshell PRIVATE
 	AUDIO_SAMPLE_RATE=48000 MINIGB_APU_AUDIO_FORMAT_S16SYS
 	LIVESHELL_SHELLUI_ELF="${ONIONHEN_OUT_BIN}/liveshell_shellui.elf"
 	LIVESHELL_PAGE_HTML="${D_CWD}/liveshell_page.html"
 	LIVESHELL_REMOTE_HTML="${D_CWD}/liveshell_remote.html"
+	LIVESHELL_I18N_JS="${D_CWD}/liveshell_i18n.js"
 	LIVESHELL_ICON_PNG="${D_CWD}/icon0.png")
 target_include_directories(liveshell PRIVATE
 	"${PROJECT_ROOT}/libonion_proc/include"

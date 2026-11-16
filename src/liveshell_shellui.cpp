@@ -37,6 +37,8 @@
 #include <ps5/kernel.h>
 
 #include <onion/detour.h>
+#include "liveshell_media.hpp"
+#include "liveshell_music_wire.hpp"
 
 extern "C" {
 int       get_module_handle(pid_t pid, const char* module_name);
@@ -263,6 +265,7 @@ void*  (*mono_object_unbox)(Obj obj);
 Obj    (*mono_object_to_string)(Obj obj, Obj* exc);
 char*  (*mono_string_to_utf8)(Obj str);
 uint32_t (*mono_gchandle_new)(Obj obj, int pinned);
+void (*mono_gchandle_free)(uint32_t handle);
 int64_t (*mono_gc_get_heap_size)()                          = nullptr; // optional: memory notes (kept players)
 int64_t (*mono_gc_get_used_size)()                          = nullptr; // optional: memory notes - what is really alive
 int (*sceKernelAvailableFlexibleMemorySize)(size_t* size) = nullptr; // optional: memory notes (kept players)
@@ -392,6 +395,7 @@ bool resolve_mono() {
 		RESOLVE(mono_object_to_string);
 		RESOLVE(mono_string_to_utf8);
 		RESOLVE(mono_gchandle_new);
+		RESOLVE(mono_gchandle_free);
 		resolve(lib, mono_gc_get_heap_size, "mono_gc_get_heap_size"); // optional
 		resolve(lib, mono_gc_get_used_size, "mono_gc_get_used_size"); // optional
 		RESOLVE(mono_method_desc_new);
@@ -879,6 +883,103 @@ int g_own_logs     = 0;
 int g_own_restarts = 0;
 bool g_own_loop_set = false;
 
+Obj g_image_view = nullptr, g_image_class = nullptr;
+uint32_t g_image_pin = 0;
+unsigned g_image_width = 1920, g_image_height = 1080;
+bool g_image_ready = false;
+int g_image_since = 0;
+std::atomic<bool> g_music_visible{false};
+
+// The home-screen process owns audible output. The payload only decodes and sends PCM.
+bool resolve_music_audio(liveshell::MusicAudioFunctions& api) {
+	const uintptr_t old = set_ucred_to_ptrace();
+	int lib = get_module_handle(getpid(), "libSceAudioOut.sprx");
+	if (lib <= 0) {
+		const int kh = get_module_handle(getpid(), "libkernel_sys.sprx");
+		using LoadFn = int (*)(const char*, size_t, const void*, uint32_t, const void*, int*);
+		LoadFn load = kh > 0 ? reinterpret_cast<LoadFn>(kernel_dynlib_dlsym(-1, kh, "sceKernelLoadStartModule")) : nullptr;
+		for (const char* root : {"/system/common/lib/", "/system/priv/lib/", "/system_ex/common_ex/lib/"}) {
+			if (load == nullptr || lib > 0) break;
+			char path[96];
+			snprintf(path, sizeof(path), "%slibSceAudioOut.sprx", root);
+			int result = 0;
+			const int id = load(path, 0, nullptr, 0, nullptr, &result);
+			if (id >= 0) {
+				lib = get_module_handle(getpid(), "libSceAudioOut.sprx");
+				if (lib <= 0) lib = id;
+			}
+		}
+	}
+	const bool ready = lib > 0 && resolve(lib, api.init, "sceAudioOutInit") &&
+	    resolve(lib, api.open, "sceAudioOutOpen") && resolve(lib, api.output, "sceAudioOutOutput") &&
+	    resolve(lib, api.close, "sceAudioOutClose");
+	if (old != 0) set_proc_authid(getpid(), old);
+	wp_log("music: AudioOut in ShellUI: %s (module %d)", ready ? "ready" : "unavailable", lib);
+	return ready;
+}
+
+void* music_receiver_thread(void*) {
+	using namespace liveshell;
+	MusicAudioFunctions api;
+	MusicAudioSink sink;
+	int socket_fd = -1;
+	long next_resolve = 0;
+	int last_result = kMusicWaiting;
+	for (;;) {
+		if (socket_fd < 0) {
+			socket_fd = socket(AF_INET, SOCK_DGRAM, 0);
+			sockaddr_in local {};
+			local.sin_family = AF_INET;
+			local.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+			local.sin_port = htons(kMusicPort);
+			timeval timeout {0, 250000};
+			if (socket_fd >= 0) setsockopt(socket_fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+			if (socket_fd < 0 || bind(socket_fd, reinterpret_cast<sockaddr*>(&local), sizeof(local)) != 0) {
+				if (socket_fd >= 0) close(socket_fd);
+				socket_fd = -1;
+				wp_log("music: cannot open receiver on %d (errno %d)", kMusicPort, errno);
+				usleep(1000 * 1000);
+				continue;
+			}
+		}
+		MusicPacket packet;
+		sockaddr_in peer {};
+		socklen_t peer_size = sizeof(peer);
+		const ssize_t n = recvfrom(socket_fd, &packet, sizeof(packet), 0, reinterpret_cast<sockaddr*>(&peer), &peer_size);
+		if (n < 0) {
+			const int socket_error = errno;
+			sink.stop(api); // no PCM: release the audible port, including after rest mode
+			if (socket_error != EAGAIN && socket_error != EWOULDBLOCK && socket_error != EINTR) {
+				close(socket_fd);
+				socket_fd = -1;
+			}
+			continue;
+		}
+		if (peer.sin_addr.s_addr != htonl(INADDR_LOOPBACK) || !valid_music_packet(packet, static_cast<size_t>(n))) continue;
+		const bool visible = g_music_visible.load();
+		if (visible && packet.frames && !api.ready() && now_ms() >= next_resolve) {
+			resolve_music_audio(api);
+			next_resolve = now_ms() + 2000;
+		}
+		const int result = sink.receive(packet, static_cast<size_t>(n), visible, api);
+		MusicAck ack;
+		ack.serial = packet.serial;
+		ack.result = result;
+		sendto(socket_fd, &ack, sizeof(ack), 0, reinterpret_cast<sockaddr*>(&peer), peer_size);
+		if (result != last_result) {
+			wp_log("music: main-port output in ShellUI result %#x", static_cast<unsigned>(result));
+			last_result = result;
+		}
+	}
+	return nullptr;
+}
+
+Obj wallpaper_view() {
+	return g_image_view != nullptr ? g_image_view : g_own_view != nullptr ? g_own_view : g_boot_player;
+}
+
+void stop_static_wallpaper();
+void image_tick();
 
 void set_blend(Obj view, bool overwrite);
 
@@ -2237,7 +2338,7 @@ bool contains_nocase(const char* hay, const char* needle) {
 int  g_blend_normal = -2;
 
 void set_blend(Obj view, bool overwrite) {
-	if (g_videoview_class == nullptr) {
+	if (view == g_image_view || g_videoview_class == nullptr) {
 		return;
 	}
 	if (g_blend_normal == -2) {
@@ -2379,7 +2480,7 @@ void focus_tick() {
 	//    app" dialog was hidden under our layers while the game pause had not kicked in yet (test 24).
 	//  - Settings with "Hide in Settings" on: focus flips before Settings is drawn, so a short wait,
 	//    then a slow eased fade (~1 s). Back home: eased fade in (~0.7 s).
-	Obj        view    = g_own_view != nullptr ? g_own_view : g_boot_player;
+	Obj        view    = wallpaper_view();
 	const bool game    = g_game_val >= 0 && focus == g_game_val;
 	// PS Store only: every tile but the Store (NPXS40047) shows Sony's own background; the video keeps
 	// playing hidden and muted, so the Store tile gets it back at once (no restart, no black).
@@ -2421,6 +2522,10 @@ void focus_tick() {
 	g_tile_hide        = (g_store_only.load() && strcmp(g_fast_tid, "NPXS40047") != 0) || g_pergame_hide;
 	const bool hide    = game || (g_menus_req.load() == 1 && g_is_settings && view != nullptr) ||
 	                  (g_tile_hide && view != nullptr);
+	const bool music = g_image_view != nullptr && g_image_ready && !hide && !window_open() && g_switch_at < 0;
+	if (g_music_visible.exchange(music) != music) {
+		to_payload('M', music ? "1" : "0", 1);
+	}
 	if (hide != g_hidden) {
 		g_hidden       = hide;
 		g_hide_changed = g_tick;
@@ -2449,6 +2554,7 @@ void focus_tick() {
 			// is in front again -> stop it (no video behind a game: it needs the decoder)
 			wp_log("game in front again before the payload's check: stopping the video started here");
 			stop_video();
+			view = wallpaper_view();
 			write_status("stopped");
 		}
 		g_self_started = false;
@@ -2511,6 +2617,7 @@ void focus_tick() {
 			}
 			snprintf(g_video_path, sizeof(g_video_path), "%s", g_switch_path);
 			start_video();
+			view = wallpaper_view();
 			g_hold_black     = true;
 			g_hold_start     = g_tick;
 			g_hold_view_tick = -1;
@@ -2523,8 +2630,8 @@ void focus_tick() {
 	} else if (g_hold_black && !(hide && game)) {
 		if (g_hold_view_tick < 0 && view != nullptr && true) { // every frame: lift the black as soon as it draws
 			// Lift the black only once the new clip really draws frames.
-			bool drawing = view != g_own_view || g_videoview_class == nullptr;
-			if (!drawing) {
+			bool drawing = view == g_image_view ? g_image_ready : view != g_own_view || g_videoview_class == nullptr;
+			if (!drawing && view != g_image_view) {
 				Obj q = property_get(g_videoview_class, view, "Position");
 				drawing = q != nullptr && *static_cast<unsigned long long*>(mono_object_unbox(q)) >= 40;
 			}
@@ -2607,6 +2714,9 @@ void focus_tick() {
 	const float vi      = xfading ? g_view_in * g_view_in * (3.0f - 2.0f * g_view_in)
 	                              : 1.0f - (1.0f - g_view_in) * (1.0f - g_view_in) * (1.0f - g_view_in);
 	float       view_op = next * vi;
+	if (view == g_image_view && !g_image_ready) {
+		view_op = 0.0f;
+	}
 	if (g_pergame_load || g_pergame_dark) {
 		view_op = 0.0f; // per game only, black over the art: the paused clip under it must not show through
 	}
@@ -2667,13 +2777,21 @@ void setup_parallax() {
 	wp_log("parallax: TransitionType getter %p, SlideInLeft %d, SlideInRight %d", g_px_getter, g_px_left, g_px_right);
 }
 
-void place_view(Obj view, bool parallax, float shift) {
-	float x = parallax ? -kOverX + shift : 0.0f, y = parallax ? -kOverY : 0.0f;
-	float w = parallax ? 1920.0f + 2 * kOverX : 1920.0f, h = parallax ? 1080.0f + 2 * kOverY : 1080.0f;
+void place_wallpaper(Obj view, float x, float y, float w, float h) {
+	if (view == g_image_view) {
+		const auto box = liveshell::media::cover(g_image_width, g_image_height, x, y, w, h);
+		x = box.x, y = box.y, w = box.w, h = box.h;
+	}
 	property_set(g_ui3_widget, view, "X", &x);
 	property_set(g_ui3_widget, view, "Y", &y);
 	property_set(g_ui3_widget, view, "Width", &w);
 	property_set(g_ui3_widget, view, "Height", &h);
+}
+
+void place_view(Obj view, bool parallax, float shift) {
+	float x = parallax ? -kOverX + shift : 0.0f, y = parallax ? -kOverY : 0.0f;
+	float w = parallax ? 1920.0f + 2 * kOverX : 1920.0f, h = parallax ? 1080.0f + 2 * kOverY : 1080.0f;
+	place_wallpaper(view, x, y, w, h);
 }
 
 // ---- game-launch transition --------------------------------------------------------------------
@@ -2694,10 +2812,7 @@ void lfx_place(Obj view, float sx, float sy, float ax, float ay, float dx, float
 	if (h < 2.0f) {
 		h = 2.0f;
 	}
-	property_set(g_ui3_widget, view, "X", &x);
-	property_set(g_ui3_widget, view, "Y", &y);
-	property_set(g_ui3_widget, view, "Width", &w);
-	property_set(g_ui3_widget, view, "Height", &h);
+	place_wallpaper(view, x, y, w, h);
 }
 
 // One frame of an effect. out: leaving for a game, k = g_fade 0 -> 1. back: k = 1 -> 0 while it settles in.
@@ -2738,7 +2853,7 @@ void* white(float alpha) {
 }
 
 void launchfx_tick() {
-	Obj       view = g_own_view != nullptr ? g_own_view : g_boot_player;
+	Obj       view = wallpaper_view();
 	const int mode = g_lfx_req.load();
 	if (view == nullptr || g_ui3_widget == nullptr) {
 		g_lfx_view = nullptr;
@@ -2789,7 +2904,7 @@ void launchfx_tick() {
 }
 
 void parallax_tick() {
-	Obj       view = g_own_view != nullptr ? g_own_view : g_boot_player;
+	Obj       view = wallpaper_view();
 	const int on   = g_parallax_req.load() == 1 && view != nullptr ? 1 : 0;
 	if (view == nullptr) {
 		return;
@@ -3329,7 +3444,7 @@ void retro_popup_setup(Obj pui, Obj asset, Obj wk) {
 			property_set(wk, bz, "Y", &by);
 			property_set(wk, bz, "Width", &bw2);
 			property_set(wk, bz, "Height", &bh2);
-			void* la[1] = {mono_string_new(g_domain, "/system_ex/vsh_asset/wallpaper/.retroui/bezel.png")};
+			void* la[1] = {mono_string_new(g_domain, "/system_ex/vsh_asset/wallpaper/video/.retroui/bezel.png")};
 			if (ld != nullptr) {
 				invoke(ld, bz, la, "ImageBox.LoadAsync(bezel)");
 			}
@@ -3575,8 +3690,8 @@ void retro_menu_setup(Obj pui, Obj wk) {
 			Obj ib = add_widget(bk, card, wk, 52.0f, y + 16.0f, 64.0f, 64.0f);
 			Obj ld = bk != nullptr ? find_method_up(bk, "LoadAsync", 1) : nullptr;
 			if (ib != nullptr && ld != nullptr) {
-				void* a[1] = {mono_string_new(g_domain, c == 0 ? "/system_ex/vsh_asset/wallpaper/.retroui/console_gb.png"
-				                                               : "/system_ex/vsh_asset/wallpaper/.retroui/console_gbc.png")};
+				void* a[1] = {mono_string_new(g_domain, c == 0 ? "/system_ex/vsh_asset/wallpaper/video/.retroui/console_gb.png"
+				                                               : "/system_ex/vsh_asset/wallpaper/video/.retroui/console_gbc.png")};
 				invoke(ld, ib, a, "ImageBox.LoadAsync(console)");
 			}
 		}
@@ -3605,7 +3720,7 @@ void retro_menu_setup(Obj pui, Obj wk) {
 			Obj ib = add_widget(bk, card, wk, x, 588.0f, 36.0f, 36.0f);
 			if (ib != nullptr && ld != nullptr) {
 				char path[96];
-				snprintf(path, sizeof(path), "/system_ex/vsh_asset/wallpaper/.retroui/%s.png", icon[i]);
+				snprintf(path, sizeof(path), "/system_ex/vsh_asset/wallpaper/video/.retroui/%s.png", icon[i]);
 				void* a[1] = {mono_string_new(g_domain, path)};
 				invoke(ld, ib, a, "ImageBox.LoadAsync(icon)");
 			}
@@ -4156,7 +4271,7 @@ int               g_stop_tick  = 0;
 bool              g_welcomed   = false;
 
 bool video_active() {
-	return g_own_view != nullptr || g_boot_player != nullptr;
+	return wallpaper_view() != nullptr;
 }
 
 // Stop the current clip. Called on the UI thread only. The player itself is not disposed here:
@@ -4322,7 +4437,8 @@ void keep_player(Obj view, Obj player, const char* path, bool uhd) {
 // The swap's "stop": the clip you leave is kept instead of destroyed. false = nothing to keep (stop_video then).
 bool park_current() {
 	g_last_swap = g_tick;
-	if (g_own_view == nullptr || g_boot_player != nullptr || g_old_view != nullptr || g_stopping || game_alive()) {
+	if (g_image_view != nullptr || liveshell::media::is_image(g_switch_path) ||
+	    g_own_view == nullptr || g_boot_player != nullptr || g_old_view != nullptr || g_stopping || game_alive()) {
 		return false;
 	}
 	Obj view = g_own_view, player = g_own_player;
@@ -4478,7 +4594,7 @@ void park_tick() {
 		return;
 	}
 	// calm: playing, no swap for 3 s, not black, not stopping, nothing 4K alive, few failures
-	if (g_warm_fails >= 3 || g_stopping || g_switch_at >= 0 || g_hold_black || g_tick - g_last_swap < 180 || // also when nothing plays (Videos per game only)
+	if (g_image_view != nullptr || g_warm_fails >= 3 || g_stopping || g_switch_at >= 0 || g_hold_black || g_tick - g_last_swap < 180 || // also when nothing plays (Videos per game only)
 	    any_uhd_alive() || g_videoview_class == nullptr) {
 		return;
 	}
@@ -4533,7 +4649,92 @@ void park_tick() {
 	}
 }
 
+// Static wallpapers use the same ImageBox.LoadAsync(uri) path as the existing UI icons.
+// Keep a separate view so video reports, resume, audio and decoder caching never touch an ImageBox.
+void stop_static_wallpaper() {
+	if (g_image_view == nullptr) {
+		return;
+	}
+	Obj view = g_image_view;
+	g_image_view = nullptr;
+	g_image_ready = false;
+	g_music_visible.store(false);
+	to_payload('M', "0", 1);
+	Obj parent = property_get(g_ui3_widget, view, "Parent");
+	void* args[1] = {view};
+	if (parent != nullptr) {
+		invoke(find_method_up(g_ui3_widget, "RemoveChild", 1), parent, args, "RemoveChild(picture)");
+	}
+	invoke(find_method_up(g_image_class, "Dispose", 0), view, nullptr, "ImageBox.Dispose");
+	mono_gchandle_free(g_image_pin);
+	g_image_pin = 0;
+}
+
+int start_static_wallpaper() {
+	const auto info = liveshell::media::image_info(g_video_path);
+	if (!info.error.empty()) {
+		wp_log("picture: %s", info.error.c_str());
+		return 60;
+	}
+	Obj pui = open_image("/system_ex/common_ex/lib/Sce.PlayStation.PUI.dll");
+	if (pui == nullptr) {
+		return 61;
+	}
+	g_image_class = mono_class_from_name(pui, "Sce.PlayStation.PUI.UI3", "ImageBox");
+	g_ui3_widget = mono_class_from_name(pui, "Sce.PlayStation.PUI.UI3", "Widget");
+	Obj scene = mono_class_from_name(pui, "Sce.PlayStation.PUI.UI3", "Scene");
+	if (g_image_class == nullptr || g_ui3_widget == nullptr || scene == nullptr) {
+		return 62;
+	}
+	Obj ctor = mono_class_get_method_from_name(g_image_class, ".ctor", 0);
+	Obj load = find_method_up(g_image_class, "LoadAsync", 1);
+	Obj root = property_get(scene, g_plugin, "RootWidget");
+	if (ctor == nullptr || load == nullptr || root == nullptr) {
+		return 63;
+	}
+	Obj box = mono_object_new(g_domain, g_image_class);
+	if (box == nullptr) {
+		return 64;
+	}
+	const uint32_t pin = mono_gchandle_new(box, 1);
+	if (!invoke(ctor, box, nullptr, "ImageBox(picture)")) {
+		mono_gchandle_free(pin);
+		return 65;
+	}
+	g_image_view = box, g_image_pin = pin;
+	g_image_width = info.w, g_image_height = info.h;
+	g_image_ready = false, g_image_since = g_tick;
+	g_resume_pos = 0;
+	place_view(box, false, 0.0f);
+	float zero = 0.0f;
+	property_set(g_ui3_widget, box, "Opacity", &zero);
+	void* uri[1] = {mono_string_new(g_domain, g_video_path)};
+	void* child[1] = {box};
+	if (!invoke(load, box, uri, "ImageBox.LoadAsync(picture)") ||
+	    !invoke(find_method_up(g_ui3_widget, "AppendChild", 1), root, child, "AppendChild(picture)")) {
+		stop_static_wallpaper();
+		return 66;
+	}
+	wp_log("picture: loading %s (%ux%u), no video player", g_video_path, info.w, info.h);
+	return 0;
+}
+
+void image_tick() {
+	if (g_image_view == nullptr || g_image_ready) {
+		return;
+	}
+	if (property_get(g_image_class, g_image_view, "Image") != nullptr) {
+		g_image_ready = true;
+		write_status("playing %s", g_video_path);
+	} else if (g_tick - g_image_since > 300) {
+		wp_log("picture: decode timed out: %s", g_video_path);
+		stop_static_wallpaper();
+		write_status("failed picture");
+	}
+}
+
 void stop_video() {
+	stop_static_wallpaper();
 	free_parked("stop");
 	if (g_old_view != nullptr) { // a cross-fade was running: the old clip goes too
 		dispose_view(g_old_view);
@@ -4582,7 +4783,8 @@ int start_video() {
 	char name[256] = {}, copy[512] = {};
 	g_play_uhd = g_on_fallback = g_start_nothing = false;
 	snprintf(g_play_path, sizeof(g_play_path), "%s", g_video_path);
-	if (!g_mode_sony && uhd_lookup(g_video_path, name, sizeof(name), copy, sizeof(copy))) {
+	const bool picture = liveshell::media::is_image(g_video_path);
+	if (!picture && !g_mode_sony && uhd_lookup(g_video_path, name, sizeof(name), copy, sizeof(copy))) {
 		if (!game_alive()) {
 			g_play_uhd = true;
 			snprintf(g_uhd_name, sizeof(g_uhd_name), "%s", name);
@@ -4594,19 +4796,21 @@ int start_video() {
 		}
 	}
 	write_status("starting");
-	const int rc = g_mode_sony ? start_video_sony() : start_own_player();
+	const int rc = picture ? start_static_wallpaper() : g_mode_sony ? start_video_sony() : start_own_player();
 	wp_log("video: start result %d (%s)", rc, g_video_path);
 	if (rc == 0) {
-		write_status("playing %s", g_video_path);
+		if (!picture) {
+			write_status("playing %s", g_video_path);
+		}
 		raise_dim();
 		if (!g_welcomed) {
 			g_welcomed = true;
-			notify("Welcome to LiveShell Engine 📺");
+			notify("Welcome to LiveShellunofficial 📺");
 		}
 	} else {
 		write_status("failed %d", rc);
 		char text[80];
-		snprintf(text, sizeof(text), "LiveShell Engine: the video could not start (%d)", rc);
+		snprintf(text, sizeof(text), "LiveShellunofficial: the wallpaper could not start (%d)", rc);
 		notify(text);
 	}
 	return rc;
@@ -4839,6 +5043,7 @@ void Update_Hook(Obj self) {
 	own_player_report();
 	if (g_installed) {
 		handle_requests();
+		image_tick();
 		focus_sound_tick();
 		fast_tick();
 		park_tick();
@@ -4872,7 +5077,7 @@ void Update_Hook(Obj self) {
 	if (rc != 0) {
 		write_status("failed setup %d", rc);
 		char text[80];
-		snprintf(text, sizeof(text), "LiveShell Engine could not start (%d)", rc);
+		snprintf(text, sizeof(text), "LiveShellunofficial could not start (%d)", rc);
 		notify(text);
 		return;
 	}
@@ -4962,7 +5167,7 @@ void* dump_thread(void*) {
 // ImageAsset.LoadAsync(uri, action, option), from React Native's image views (set_Source) and PUI image boxes
 // (ImageBox.LoadAsync). From the start every image box that loads an avatar is remembered with its address.
 // A user with /data/LiveShell/video/.avatars/<id>.png (ShellUI sees that folder as
-// /system_ex/vsh_asset/wallpaper/.avatars) gets that picture instead, decoded as an animated PNG
+// /system_ex/vsh_asset/wallpaper/video/.avatars) gets that picture instead, decoded as an animated PNG
 // (ImageOptions.IsAnimatedImage; the image box loops it). When the file appears or changes, a hidden image box
 // decodes it (a fraction of a second) and then every remembered avatar of that user switches at once; when it
 // goes, they all load Sony's again. Until a new one is decoded, new loads get <id>_still.png (its first
@@ -4971,7 +5176,7 @@ void* dump_thread(void*) {
 // after rest mode) are found by walking every scene's widgets (SceneManager.Instance.SceneLayers ->
 // RootWidget -> FirstChildBase / NextSiblingBase): at the start, now and then, and when an avatar changes.
 // "?ts=<time>" (as Sony does for game icons): a new file is not taken from the image cache.
-constexpr const char* kAvatarDir = "/system_ex/vsh_asset/wallpaper/.avatars";
+constexpr const char* kAvatarDir = "/system_ex/vsh_asset/wallpaper/video/.avatars";
 using AssetLoadFn = Obj (*)(Obj uri, Obj action, Obj option);
 using SetSourceFn = void (*)(Obj self, Obj source);
 using BoxLoadFn   = void (*)(Obj self, Obj uri, Obj action, Obj option, bool set_image);
@@ -5153,7 +5358,7 @@ bool refresh_view(Obj view, const char* uri, bool animated) {
 // of them (as avatars use) froze the tile on its first picture after the Media tab. Stable address, like
 // avatars. Tiles already on screen are switched by the widget walk; a removed / changed file switches them back
 // / again (the folder's time is watched, so a pick shows within a moment).
-constexpr const char* kTileDir = "/system_ex/vsh_asset/wallpaper/.tiles";
+constexpr const char* kTileDir = "/system_ex/vsh_asset/wallpaper/video/.tiles";
 struct TileOrig {
 	char tid[10];
 	char uri[200]; // Sony's address for the tile, loaded again when ours goes
@@ -5742,6 +5947,7 @@ void* wallpaper_thread(void*) {
 		if (++status_beat >= 7 && g_last_status[0] != 0) {
 			status_beat = 0;
 			to_payload('S', g_last_status, strlen(g_last_status));
+			to_payload('M', g_music_visible.load() ? "1" : "0", 1);
 		}
 		if (OptFile* f = opt_open(kVolumeFile)) {
 			int vol = -1;
@@ -5857,10 +6063,10 @@ extern "C" int main(int argc, char const* argv[]) {
 	};
 
 	if (!resolve_kernel()) {
-		return fail("LiveShell Engine could not start (kernel symbols missing)", 1);
+		return fail("LiveShellunofficial could not start (kernel symbols missing)", 1);
 	}
 	if (!resolve_mono()) {
-		return fail("LiveShell Engine could not start (Mono symbols missing)", 1);
+		return fail("LiveShellunofficial could not start (Mono symbols missing)", 1);
 	}
 	g_step.store("mono_get_root_domain / mono_thread_attach");
 	g_domain = mono_get_root_domain();
@@ -5876,14 +6082,14 @@ extern "C" int main(int argc, char const* argv[]) {
 	Obj pui_image = open_image("/system_ex/common_ex/lib/Sce.PlayStation.PUI.dll");
 	wp_log("PUI image %p", pui_image);
 	if (pui_image == nullptr) {
-		return fail("LiveShell Engine could not start (PUI not found)", 2);
+		return fail("LiveShellunofficial could not start (PUI not found)", 2);
 	}
 	g_step.store("compile Application.Update");
 	const uint64_t update_addr =
 	    get_method_address(pui_image, "Sce.PlayStation.PUI", "Application", "Update", 0);
 	wp_log("Application.Update compiled at %#lx", static_cast<unsigned long>(update_addr));
 	if (update_addr == 0) {
-		return fail("LiveShell Engine could not start (Update not found)", 3);
+		return fail("LiveShellunofficial could not start (Update not found)", 3);
 	}
 	g_step.store("InstallDetour(Application.Update)");
 	if (!InstallDetour(update_addr, reinterpret_cast<void*>(&Update_Hook),
@@ -5953,7 +6159,7 @@ extern "C" int main(int argc, char const* argv[]) {
 		if (g_update_orig == nullptr) {
 			wp_log("Application.Update: no other hook to chain after (next %#lx)", static_cast<unsigned long>(next));
 			write_status("failed hook"); // the payload restarts the home screen once (an old module holds the hook)
-			return fail("LiveShell Engine could not start (hook failed)", 4);
+			return fail("LiveShellunofficial could not start (hook failed)", 4);
 		}
 		if (next != 0) {
 			wp_log("Application.Update already hooked by another tool: chained after it at %#lx",
@@ -5965,6 +6171,13 @@ extern "C" int main(int argc, char const* argv[]) {
 
 	if (old_authid != 0) {
 		set_proc_authid(pid, old_authid);
+	}
+
+	pthread_t music_thread;
+	if (pthread_create(&music_thread, nullptr, music_receiver_thread, nullptr) == 0) {
+		pthread_detach(music_thread);
+	} else {
+		wp_log("music receiver could not start");
 	}
 
 	pthread_t thread;

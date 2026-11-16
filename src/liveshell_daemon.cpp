@@ -150,6 +150,7 @@ std::string g_game_title;
 std::string g_override;     // per-game clip playing instead of g_current ("" = main wallpaper)
 volatile bool g_focus_recheck = false; // games.txt changed: re-evaluate the highlighted game now
 std::string g_current;          // real path of the chosen clip
+std::string g_language = "zh-CN"; // shared by the PS5 and phone / PC pages
 std::string g_mounted_folder;   // folder currently mounted on kMountPoint
 bool        g_injected = false; // the ShellUI module is running (it reacts to the path file)
 
@@ -358,7 +359,7 @@ bool ensure_mount_point() {
 // /system_ex does not show there, so the window is opened in every sandbox too.
 void mount_window_everywhere(const std::string& folder) {
 	if (!ensure_mount_point()) {
-		notify("LiveShell Engine could not prepare its video folder. Log: /data/LiveShell/liveshell.log");
+		notify("LiveShellunofficial could not prepare its video folder. Log: /data/LiveShell/liveshell.log");
 		return;
 	}
 	if (!mount_window_at(kMountPoint, folder.c_str())) {
@@ -444,6 +445,8 @@ void load_config() {
 			g_enabled = line.substr(8) != "0";
 		} else if (line.rfind("video=", 0) == 0) {
 			g_current = line.substr(6);
+		} else if (line.rfind("language=", 0) == 0) {
+			g_language = line.substr(9) == "en" ? "en" : "zh-CN";
 		} else if (line.rfind("dim=", 0) == 0) {
 			g_dim = std::max(0, std::min(80, atoi(line.c_str() + 4)));
 		} else if (line.rfind("volume=", 0) == 0) {
@@ -505,7 +508,7 @@ void load_config() {
 
 void save_config() {
 	write_text(kConfigFile, std::string("enabled=") + (g_enabled ? "1" : "0") + "\nvideo=" + g_current + "\ndim=" + std::to_string(g_dim) + "\nvolume=" + std::to_string(g_volume) + "\nlooks=" + looks_text() +
-	                            "\nshuffle=" + (g_shuffle ? "1" : "0") + "\nmainvideo=1\npergameonly=" + (g_main_video ? "0" : "1") + "\ngamevideos=" + (g_game_videos ? "1" : "0") + "\ngamepause=" + (g_game_pause ? "1" : "0") + "\nmenuhide=" + (g_menu_hide ? "1" : "0") + "\nstoreonly=" + (g_store_only ? "1" : "0") + "\nparallax=" + (g_parallax ? "1" : "0") + "\nautomatch=" + (g_auto_match ? "1" : "0") + "\nresume=" + (g_resume ? "1" : "0") + "\nlaunchfx=" + std::to_string(g_launchfx) + "\nautonext=" + std::to_string(g_autonext) + "\ntint=" + std::to_string(g_tint) + "\noffusers=" + g_off_users + "\ngamehide=" + (g_game_hide ? "1" : "0") + "\n");
+	                            "\nshuffle=" + (g_shuffle ? "1" : "0") + "\nmainvideo=1\npergameonly=" + (g_main_video ? "0" : "1") + "\ngamevideos=" + (g_game_videos ? "1" : "0") + "\ngamepause=" + (g_game_pause ? "1" : "0") + "\nmenuhide=" + (g_menu_hide ? "1" : "0") + "\nstoreonly=" + (g_store_only ? "1" : "0") + "\nparallax=" + (g_parallax ? "1" : "0") + "\nautomatch=" + (g_auto_match ? "1" : "0") + "\nresume=" + (g_resume ? "1" : "0") + "\nlaunchfx=" + std::to_string(g_launchfx) + "\nautonext=" + std::to_string(g_autonext) + "\ntint=" + std::to_string(g_tint) + "\noffusers=" + g_off_users + "\ngamehide=" + (g_game_hide ? "1" : "0") + "\nlanguage=" + g_language + "\n");
 }
 
 // ---- telling ShellUI what to play ------------------------------------------------------------
@@ -662,6 +665,8 @@ void* ui_thread(void*) {
 			std::lock_guard<std::mutex> lock(g_ui_lock);
 			g_ended_clip.assign(buf + 1, static_cast<size_t>(n - 1));
 			g_ended = true;
+		} else if (buf[0] == 'M' && n == 2) {
+			music_visible(buf[1] == '1');
 		} else if (buf[0] == 'S' || buf[0] == 'F') {
 			std::lock_guard<std::mutex> lock(g_ui_lock);
 			(buf[0] == 'S' ? g_ui_status : g_ui_focus).assign(buf + 1, static_cast<size_t>(n - 1));
@@ -693,8 +698,8 @@ bool wait_shellui_stopped(int timeout_ms) {
 // The folder we mount for a clip: the whole video tree (internal video folder, or the USB liveshell
 // folder), so clips in game subfolders (video/PPSA01234/) share one mount and can cross-fade.
 std::string mount_base(const std::string& clip) {
-	const std::string internal = "/data/LiveShell/video";
-	if (clip.rfind(internal + "/", 0) == 0) {
+	const std::string internal = "/data/LiveShell";
+	if (clip.rfind(internal + "/video/", 0) == 0 || clip.rfind(internal + "/pictures/", 0) == 0) {
 		return internal;
 	}
 	if (clip.rfind("/mnt/usb", 0) == 0) {
@@ -861,7 +866,7 @@ pid_t inject_shellui() {
 		return 0;
 	}
 	if (kOnionGuard && (onion_daemon_answers() || read_pid_file(kOnionToolbox) == pid)) {
-		notify("LiveShell Engine can't run while OnionHEN is running.");
+		notify("LiveShellunofficial can't run while OnionHEN is running.");
 		return -1;
 	}
 	if (read_pid_file(kOurMarker) == pid) {
@@ -874,7 +879,7 @@ pid_t inject_shellui() {
 	log("injecting into SceShellUI pid %d", static_cast<int>(pid));
 	if (!Inject_Toolbox(static_cast<int>(pid), liveshell_shellui_elf_start)) {
 		log("injection FAILED");
-		notify("LiveShell Engine could not start (injection failed).");
+		notify("LiveShellunofficial could not start (injection failed).");
 		return -1;
 	}
 	write_text(kOurMarker, std::to_string(pid));
@@ -1293,9 +1298,9 @@ void* after_start_thread(void*) {
 	}
 	const int rc = install_tile();
 	if (rc == 1) {
-		notify("LiveShell Engine was added to your home screen.");
+		notify("LiveShellunofficial was added to your home screen.");
 	} else if (rc < 0) {
-		notify_plain("LiveShell Engine: could not add the home screen tile (see liveshell.log).");
+		notify_plain("LiveShellunofficial: could not add the home screen tile (see liveshell.log).");
 	}
 	return nullptr;
 }
@@ -1385,7 +1390,7 @@ void set_favorite(const std::string& path, bool on) {
 
 std::vector<Video> list_videos() {
 	std::vector<Video> all;
-	auto scan = [&](const std::string& folder, const std::string& where) {
+	auto scan = [&](const std::string& folder, const std::string& where, bool pictures = false) {
 		DIR* dir = opendir(folder.c_str());
 		if (dir == nullptr) {
 			return;
@@ -1393,10 +1398,12 @@ std::vector<Video> list_videos() {
 		// By date then name here; the whole list is put newest first at the end (all folders together).
 		std::vector<std::pair<long long, Video>> found;
 		while (dirent* e = readdir(dir)) {
-			if (is_mp4(e->d_name)) {
+			if (e->d_name[0] != '.' && (pictures ? media::is_image(e->d_name) : is_mp4(e->d_name))) {
 				Video       v {folder + "/" + e->d_name, e->d_name, where};
 				struct stat st {};
-				found.push_back({stat(v.path.c_str(), &st) == 0 ? static_cast<long long>(st.st_mtime) : 0LL, v});
+				if (stat(v.path.c_str(), &st) == 0 && S_ISREG(st.st_mode)) {
+					found.push_back({static_cast<long long>(st.st_mtime), v});
+				}
 			}
 		}
 		closedir(dir);
@@ -1425,6 +1432,8 @@ std::vector<Video> list_videos() {
 	};
 	scan("/data/LiveShell/video", "Internal");
 	scan_games("/data/LiveShell/video", "Internal");
+	// Dedicated picture folders avoid interpreting existing <video>.png thumbnails as wallpapers.
+	scan("/data/LiveShell/pictures", "Internal", true);
 	// USB: a folder called liveshell in any capitalisation (the drive's file system is case
 	// sensitive here), clips directly inside it and/or in a "video" subfolder.
 	auto subdir = [](const std::string& parent, const char* want) {
@@ -1449,6 +1458,10 @@ std::vector<Video> list_videos() {
 		scan(root, where);
 		scan_games(root, where);
 		const std::string video = subdir(root, "video");
+		const std::string pictures = subdir(root, "pictures");
+		if (!pictures.empty()) {
+			scan(pictures, where, true);
+		}
 		if (!video.empty()) {
 			scan(video, where);
 			scan_games(video, where);
@@ -1501,6 +1514,7 @@ State get_state() {
 		std::lock_guard<std::mutex> lock(g_ctl);
 		st.enabled = g_enabled;
 		st.current = g_current;
+		st.language = g_language;
 		st.dim     = g_dim;
 		st.volume  = g_volume;
 		for (int l = 0; l < 4; ++l) {
@@ -1532,11 +1546,22 @@ State get_state() {
 	return st;
 }
 
+bool set_language(const std::string& language, std::string& error) {
+	if (language != "zh-CN" && language != "en") {
+		error = "Unsupported language";
+		return false;
+	}
+	std::lock_guard<std::mutex> lock(g_ctl);
+	g_language = language;
+	save_config();
+	return true;
+}
+
 void save_user_wall(const std::string& path); // Users: the signed-in user's own main wallpaper
 
 bool select_video(const std::string& path, std::string& error) {
 	if (!exists(path.c_str())) {
-		error = "That video is gone";
+		error = "That wallpaper is gone";
 		return false;
 	}
 	if (refuse_4k(path, error)) {
@@ -1659,7 +1684,7 @@ std::vector<Playlist> parse_playlists(const std::string& text) {
 			p.shuffle = f[4] == "1";
 			out.push_back(p);
 		} else if (f[0] == "V" && f.size() >= 2 && !out.empty() && out.back().videos.size() < 5000 &&
-		           f[1].rfind("/", 0) == 0 && f[1].find("..") == std::string::npos && is_mp4(f[1].c_str())) {
+		           f[1].rfind("/", 0) == 0 && f[1].find("..") == std::string::npos && media::is_wallpaper(f[1])) {
 			out.back().videos.push_back(f[1]);
 		}
 	}
@@ -1764,6 +1789,12 @@ void load_playlists() {
 
 bool set_playlists(const std::string& text, std::string& error) {
 	std::vector<Playlist> pls = parse_playlists(text);
+	for (const Playlist& p : pls) {
+		if (p.every == 0 && std::any_of(p.videos.begin(), p.videos.end(), media::is_image)) {
+			error = "Pictures need a timed playlist; choose an interval instead of when each video ends";
+			return false;
+		}
+	}
 	std::lock_guard<std::mutex> lock(g_ctl);
 	std::string before, after;
 	for (const Playlist& p : g_playlists) {
@@ -2436,7 +2467,9 @@ bool delete_video(const std::string& path, std::string& error) {
 	}
 	const std::string cover = path.substr(0, path.rfind('.')) + ".png";
 	const bool        ok    = unlink(path.c_str()) == 0;
-	unlink(cover.c_str());
+	if (!media::is_image(path)) {
+		unlink(cover.c_str());
+	}
 	log("delete %s: %s", path.c_str(), ok ? "done" : strerror(errno));
 	if (ok) {
 		set_favorite(path, false);
@@ -2585,7 +2618,7 @@ void ensure_tile_background(const std::string& tid) {
 			break;
 		}
 	}
-	notify_plain((name + " is ready for its own video. Shut down LiveShell Engine and load it again to see it.").c_str());
+	notify_plain((name + " is ready for its own video. Shut down LiveShellunofficial and load it again to see it.").c_str());
 }
 
 void set_game_background(const std::string& tid, const std::string& path) {
@@ -2716,6 +2749,9 @@ bool track_is_silent(int fd, const std::string& moov, size_t hdlr_at) {
 // Does the clip have a sound track you can hear? An mp4 'hdlr' box of type 'soun' inside 'moov', and not only
 // silence (track_is_silent). Cached by size + date; unreadable = assume sound (the old behaviour). Caller holds g_ctl.
 bool clip_has_audio(const std::string& path) {
+	if (media::is_image(path)) {
+		return false;
+	}
 	static std::map<std::string, std::pair<long long, bool>> cache;
 	struct stat st {};
 	if (stat(path.c_str(), &st) != 0) {
@@ -2911,6 +2947,9 @@ ClipInfo clip_info(const std::string& path) {
 
 // Is the clip bigger than 1080p (4K is not supported: ShellUI's player gets a Full HD decoder only)?
 bool clip_is_big(const std::string& path) {
+	if (media::is_image(path)) {
+		return false; // pictures use ImageBox, never a UHD video decoder
+	}
 	const ClipInfo ci  = clip_info(path);
 	const bool     big = ci.w > 1920 || ci.h > 1088;
 	return big;
@@ -2918,6 +2957,9 @@ bool clip_is_big(const std::string& path) {
 
 // The badge in the video lists: "4K", "2K", "FHD", "HD" or "" (smaller / unknown).
 std::string clip_res(const std::string& path) {
+	if (media::is_image(path)) {
+		return media::extension(path) == ".png" ? "PNG" : "JPG";
+	}
 	const ClipInfo ci = clip_info(path);
 	const unsigned a  = std::max(ci.w, ci.h), b = std::min(ci.w, ci.h); // portrait clips too
 	if (a == 0) {
@@ -2929,6 +2971,9 @@ std::string clip_res(const std::string& path) {
 // "Can I play this?": why the PS5 will not play the clip ("" = it plays, or its header could not be read).
 // Limits: H.264 up to level 4.2, HEVC up to level 4.1, 8-bit 4:2:0, at most 1920x1088.
 std::string clip_problem(const std::string& path) {
+	if (media::is_image(path)) {
+		return media::image_info(path).error;
+	}
 	const ClipInfo ci = clip_info(path);
 	char           why[96] = {};
 	if (ci.cut) {
@@ -3118,6 +3163,10 @@ std::string game_clip(const std::string& tid) {
 // 4K plays (v1.4, UHD stream); bigger than 4K does not: say so instead of a black screen. True = refused
 // (error set + PS5 notifications). Takes no lock.
 bool refuse_4k(const std::string& path, std::string& error) {
+	if (media::is_image(path)) {
+		error = media::image_info(path).error;
+		return !error.empty();
+	}
 	const ClipInfo ci = clip_info(path);
 	if (ci.w <= 3840 && ci.h <= 2160) {
 		return false;
@@ -3331,7 +3380,9 @@ void* autonext_thread(void*) {
 				pool.push_back(v.path);
 			}
 		}
-		pool.erase(std::remove_if(pool.begin(), pool.end(), [](const std::string& v) { return !exists(v.c_str()); }), pool.end());
+		pool.erase(std::remove_if(pool.begin(), pool.end(), [](const std::string& v) {
+			return media::is_image(v) || !exists(v.c_str()); // pictures have no end event
+		}), pool.end());
 		if (pool.size() < 2) {
 			continue;
 		}
@@ -3463,6 +3514,8 @@ using namespace liveshell;
 int main() {
 	mkdir("/data/LiveShell", 0777);
 	mkdir("/data/LiveShell/video", 0777);
+	mkdir("/data/LiveShell/pictures", 0777);
+	mkdir("/data/LiveShell/music", 0777);
 	mkdir("/system_tmp/liveshell", 0777);
 	// The files ShellUI cannot do without get their slot first (/system_tmp: ~33 files for everyone).
 	for (const char* f : {kPathFile, kOptsFile, "/system_tmp/liveshell/fast.txt", "/system_tmp/liveshell/games.txt"}) {
@@ -3488,7 +3541,7 @@ int main() {
 	onion_log_set_level(ONION_LOG_DEBUG);
 
 	if (kOnionGuard && onion_daemon_answers()) {
-		notify("LiveShell Engine can't run while OnionHEN is running.");
+		notify("LiveShellunofficial can't run while OnionHEN is running.");
 		return 1;
 	}
 
@@ -3506,7 +3559,7 @@ int main() {
 			srand(static_cast<unsigned>(time(nullptr)) ^ static_cast<unsigned>(getpid()));
 			std::vector<std::string> others;
 			for (const Video& v : videos) {
-				if (v.path != g_current) {
+				if (v.path != g_current && media::is_image(v.path) == media::is_image(g_current)) {
 					others.push_back(v.path);
 				}
 			}
@@ -3528,7 +3581,7 @@ int main() {
 		apply_locked(error); // not injected yet: just mounts + writes the path file
 	}
 	if (videos.empty()) {
-		notify_plain("No video found. Put an .mp4 in /data/LiveShell/video or in a liveshell folder on a USB drive.");
+		notify_plain("No wallpaper found. Add MP4s to /data/LiveShell/video, or PNG/JPEGs to /data/LiveShell/pictures (USB: liveshell/video or liveshell/pictures).");
 	}
 
 	start_thread(ui_thread); // before the injection: ShellUI talks to us from its first line
@@ -3572,6 +3625,7 @@ int main() {
 	if (last_pid < 0) {
 		return 3;
 	}
+	start_music();
 	{
 		std::lock_guard<std::mutex> lock(g_ctl);
 		g_injected = last_pid > 0;
@@ -3654,7 +3708,7 @@ int main() {
 			static bool retried = false;
 			if (retried) {
 				log("ShellUI died %ld s after injection again: treating it as a crash, not re-injecting", alive);
-				notify("LiveShell Engine stopped: the home screen crashed. Log: /data/LiveShell/liveshell.log");
+				notify("LiveShellunofficial stopped: the home screen crashed. Log: /data/LiveShell/liveshell.log");
 				break;
 			}
 			retried = true;
@@ -3684,6 +3738,7 @@ int main() {
 		g_injected = true;
 	}
 
+	stop_music();
 	copy_shellui_log();
 	// With OnionHEN running, restarting ShellUI would take OnionHEN's toolbox down too. Soft stop
 	// instead: video off, looks off, folder unmounted; the idle module stays parked in ShellUI and
@@ -3701,7 +3756,7 @@ int main() {
 		unmount_window_everywhere();
 		log("LiveShell stopped (soft: OnionHEN keeps running, the idle module stays in ShellUI)");
 		if (!g_replaced) {
-			notify("LiveShell Engine stopped."); // not when a newer LiveShell takes over (it says it started)
+			notify("LiveShellunofficial stopped."); // not when a newer LiveShell takes over (it says it started)
 		}
 		_exit(0); // see below
 	}
@@ -3716,7 +3771,7 @@ int main() {
 	ui_forget_status();
 	log("LiveShell stopped");
 	if (!g_replaced) {
-		notify("LiveShell Engine stopped."); // not when a newer LiveShell takes over (it says it started)
+		notify("LiveShellunofficial stopped."); // not when a newer LiveShell takes over (it says it started)
 	}
 	// _exit, not return: with libSceNet/libSceHttp linked, a normal exit hung in their
 	// shutdown and the process stayed alive holding ports 9049/9050/9051 - the next LiveShell got a white
